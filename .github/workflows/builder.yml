@@ -31,9 +31,9 @@ jobs:
           cp -a archiso /tmp/work/profile
           cd /tmp/work
           
-          # Устанавливаем пакеты в airootfs через pacstrap (без флага -d)
+          # Устанавливаем пакеты в airootfs через pacstrap (--noconfirm чтобы не ждал ввода)
           mkdir -p airootfs
-          pacstrap -C profile/pacman.conf -c -G -i airootfs $(cat /tmp/pkglist.txt)
+          pacstrap -C profile/pacman.conf -c -G -i --noconfirm airootfs $(cat /tmp/pkglist.txt)
           
           # Копируем твои файлы из airootfs профиля (SafeGuard и т.д.)
           cp -a profile/airootfs/* airootfs/ 2>/dev/null || true
