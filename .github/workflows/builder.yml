@@ -22,8 +22,8 @@ jobs:
           # Очищаем список от комментариев и пустых строк
           grep -v '^#' packages.x86_64 | grep -v '^$' | sed 's/\r$//' > /tmp/pkglist.txt
           
-          # Скачиваем пакеты в кэш (флаг -w: только скачать, -S: синхронизация)
-          pacman -Syw --noconfirm --cachedir /var/cache/pacman/pkg/ - < /tmp/pkglist.txt || pacman -Syw --noconfirm --cachedir /var/cache/pacman/pkg/ $(cat /tmp/pkglist.txt)
+          # Скачиваем пакеты в кэш
+          pacman -Syw --noconfirm --cachedir /var/cache/pacman/pkg/ $(cat /tmp/pkglist.txt)
 
       - name: Build airootfs (only)
         run: |
@@ -31,14 +31,14 @@ jobs:
           cp -a archiso /tmp/work/profile
           cd /tmp/work
           
-          # Устанавливаем пакеты в airootfs через pacstrap
+          # Устанавливаем пакеты в airootfs через pacstrap (без флага -d)
           mkdir -p airootfs
-          pacstrap -C profile/pacman.conf -c -d -G -i airootfs $(cat /tmp/pkglist.txt)
+          pacstrap -C profile/pacman.conf -c -G -i airootfs $(cat /tmp/pkglist.txt)
           
-          # Копируем твои файлы из airootfs профиля
+          # Копируем твои файлы из airootfs профиля (SafeGuard и т.д.)
           cp -a profile/airootfs/* airootfs/ 2>/dev/null || true
           
-          # Запускаем customize_airootfs.sh
+          # Запускаем customize_airootfs.sh (если есть)
           if [ -f airootfs/root/customize_airootfs.sh ]; then
             chroot airootfs /bin/bash /root/customize_airootfs.sh || true
           fi
