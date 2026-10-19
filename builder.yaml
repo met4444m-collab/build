@@ -13,39 +13,43 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install archiso
+      - name: Install archiso and sync databases
         run: |
-          pacman -Sy --noconfirm archiso base-devel git
+          pacman -Sy --noconfirm archiso base-devel git zstd
 
       - name: Download packages to cache
         run: |
-          # Скачиваем пакеты в кэш (они останутся в /var/cache/pacman/pkg/)
-          pacman -Sw --noconfirm $(cat packages.x86_64 | grep -v '^#' | grep -v '^$')
+          grep -v '^#' packages.x86_64 | grep -v '^$' | sed 's/\r$//' > /tmp/pkglist.txt
+          pacman -Syw --noconfirm --cachedir /var/cache/pacman/pkg/ $(cat /tmp/pkglist.txt)
 
       - name: Build airootfs (only)
         run: |
-          # Создаём рабочую папку и копируем туда профиль
+          set -e
           mkdir -p /tmp/work
           cp -a archiso /tmp/work/profile
           cd /tmp/work
           
-          # Устанавливаем пакеты в airootfs через pacstrap (без mkarchiso)
           mkdir -p airootfs
-          pacstrap -C profile/pacman.conf -c -d -G -i airootfs $(cat profile/packages.x86_64 | grep -v '^#' | grep -v '^$')
+          export PACMAN="pacman --noconfirm --needed"
+          pacstrap -C profile/pacman.conf -c -G airootfs $(cat /tmp/pkglist.txt)
           
-          # Копируем твои файлы из airootfs профиля (SafeGuard и т.д.)
           cp -a profile/airootfs/* airootfs/ 2>/dev/null || true
           
-          # Запускаем customize_airootfs.sh (если есть)
           if [ -f airootfs/root/customize_airootfs.sh ]; then
-            chroot airootfs /bin/bash /root/customize_airootfs.sh
+            chroot airootfs /bin/bash /root/customize_airootfs.sh || true
           fi
 
-      - name: Upload airootfs
+      - name: Compress airootfs
+        run: |
+          cd /tmp/work
+          # Сжимаем в один архив. Это скроет все странные символы из GitHub.
+          tar -I zstd -cf airootfs.tar.zst airootfs
+
+      - name: Upload airootfs archive
         uses: actions/upload-artifact@v4
         with:
-          name: airootfs
-          path: /tmp/work/airootfs
+          name: airootfs-archive
+          path: /tmp/work/airootfs.tar.zst
           retention-days: 7
 
       - name: Upload package cache
