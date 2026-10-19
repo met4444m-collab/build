@@ -1,0 +1,56 @@
+name: SafeGamingOS Builder
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-base:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+      options: --privileged
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install archiso
+        run: |
+          pacman -Sy --noconfirm archiso base-devel git
+
+      - name: Download packages to cache
+        run: |
+          # Скачиваем пакеты в кэш (они останутся в /var/cache/pacman/pkg/)
+          pacman -Sw --noconfirm $(cat packages.x86_64 | grep -v '^#' | grep -v '^$')
+
+      - name: Build airootfs (only)
+        run: |
+          # Создаём рабочую папку и копируем туда профиль
+          mkdir -p /tmp/work
+          cp -a archiso /tmp/work/profile
+          cd /tmp/work
+          
+          # Устанавливаем пакеты в airootfs через pacstrap (без mkarchiso)
+          mkdir -p airootfs
+          pacstrap -C profile/pacman.conf -c -d -G -i airootfs $(cat profile/packages.x86_64 | grep -v '^#' | grep -v '^$')
+          
+          # Копируем твои файлы из airootfs профиля (SafeGuard и т.д.)
+          cp -a profile/airootfs/* airootfs/ 2>/dev/null || true
+          
+          # Запускаем customize_airootfs.sh (если есть)
+          if [ -f airootfs/root/customize_airootfs.sh ]; then
+            chroot airootfs /bin/bash /root/customize_airootfs.sh
+          fi
+
+      - name: Upload airootfs
+        uses: actions/upload-artifact@v4
+        with:
+          name: airootfs
+          path: /tmp/work/airootfs
+          retention-days: 7
+
+      - name: Upload package cache
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-cache
+          path: /var/cache/pacman/pkg/
+          retention-days: 7
