@@ -15,14 +15,14 @@ jobs:
 
       - name: Install archiso and sync databases
         run: |
-          pacman -Sy --noconfirm archiso base-devel git
+          pacman -Sy --noconfirm archiso base-devel git zstd
 
       - name: Download packages to cache
         run: |
           grep -v '^#' packages.x86_64 | grep -v '^$' | sed 's/\r$//' > /tmp/pkglist.txt
           pacman -Syw --noconfirm --cachedir /var/cache/pacman/pkg/ $(cat /tmp/pkglist.txt)
 
-      - name: Build airootfs (only)
+      - name: Build and Compress airootfs
         run: |
           set -e
           mkdir -p /tmp/work
@@ -30,26 +30,24 @@ jobs:
           cd /tmp/work
           
           mkdir -p airootfs
-          
-          # Ключевой фикс: у pacstrap НЕТ --noconfirm.
-          # Передаём его в pacman через переменную окружения PACMAN.
-          # Также убираем -i (интерактивный режим), чтобы не ждал ввода.
           export PACMAN="pacman --noconfirm --needed"
-          
           pacstrap -C profile/pacman.conf -c -G airootfs $(cat /tmp/pkglist.txt)
           
-          # Копируем твои файлы поверх установленной системы
           cp -a profile/airootfs/* airootfs/ 2>/dev/null || true
           
           if [ -f airootfs/root/customize_airootfs.sh ]; then
             chroot airootfs /bin/bash /root/customize_airootfs.sh || true
           fi
+          
+          # ВОТ ГЛАВНОЕ: пакуем в архив прямо здесь
+          tar -I zstd -cf airootfs.tar.zst airootfs
+          rm -rf airootfs  # Удаляем папку, чтобы GitHub ее не видел
 
-      - name: Upload airootfs
+      - name: Upload airootfs archive
         uses: actions/upload-artifact@v4
         with:
-          name: airootfs
-          path: /tmp/work/airootfs
+          name: airootfs-archive
+          path: /tmp/work/airootfs.tar.zst
           retention-days: 7
 
       - name: Upload package cache
