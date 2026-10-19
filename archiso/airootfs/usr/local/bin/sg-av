@@ -1,0 +1,351 @@
+#!/usr/bin/env bash
+# safegamingOS — SafeGuard: антивирус и защита комнат.
+#
+# Usage:
+#   sudo sg-av scan FILE [--room ROOM] [--url URL] [--yes]
+#       Сканировать файл (ClamAV). При обнаружении вируса:
+#       - блокирует источник (URL), если он известен;
+#       - предлагает: карантин комнаты / удалить комнату / оставить (решение пользователя).
+#       --yes = автоматически: заблокировать URL + карантин комнаты.
+#   sudo sg-av status [--room ROOM]
+#       Журнал загрузок (с источниками), заблокированные URL, карантин.
+#   sudo sg-av live
+#       Живой мониторинг: сколько RAM/CPU реально ест каждая комната
+#       (по cgroup-лимитам из sg-room-run --mem/--cpu).
+#   sudo sg-av block URL [virus]
+#   sudo sg-av unblock URL
+#   sudo sg-av quarantine ROOM [причина]
+#   sudo sg-av restore ROOM
+#   sudo sg-av delete ROOM
+#   sudo sg-av watch [--interval N] [--cpu-limit PCT] [--hits N] [--auto-quarantine]
+#       Поведенческий сторож (без сигнатур): устойчивая CPU-нагрузка (майнер),
+#       упор в TasksMax (fork-бомба), упор в лимит RAM. Работает фоном как
+#       служба sg-watch; события — в журнал SafeGuard. По умолчанию только
+#       детектит и логирует; --auto-quarantine = карантин по решению системы
+#       (по ТЗ решение принимает пользователь — флаг по умолчанию выключен).
+#   sudo sg-av scan-rooms [--yes]
+#       Плановое сканирование всех активных комнат (ClamAV, еженедельно по
+#       расписанию: sg-av-scan.timer). При находке: блокирует источник-URL,
+#       пишет событие в журнал; решение о карантине остаётся за пользователем
+#       (--yes = авто-карантин заражённой комнаты).
+set -uo pipefail
+
+source /usr/local/lib/sg-rooms/lib.sh
+sg_require sqlite3
+
+usage() { grep '^#' "$0" | sed 's/^# \{0,1\}//' | grep -v 'env bash'; }
+
+# ---------------------------------------------------------------------------
+scan() {
+  local file="" room_arg="" url_arg="" yes=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --room) room_arg="${2:-}"; shift 2 ;;
+      --url)  url_arg="${2:-}"; shift 2 ;;
+      --yes)  yes=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *)      file="$1"; shift ;;
+    esac
+  done
+  [[ -n "${file}" ]] || { echo "usage: sg-av scan FILE [--room ROOM] [--url URL] [--yes]" >&2; exit 1; }
+
+  if ! command -v clamscan >/dev/null 2>&1; then
+    echo "!! ClamAV не установлен. Установите:" >&2
+    echo "   sudo pacman -S clamav && sudo freshclam" >&2
+    exit 2
+  fi
+  [[ -r "${file}" ]] || { echo "error: нет доступа к файлу: ${file}" >&2; exit 1; }
+
+  sg_ensure_db
+  local real_path row room url
+  real_path="$(readlink -f "${file}" 2>/dev/null || echo "${file}")"
+  row="$(sg_download_find "${real_path}")"
+  room="${room_arg}"
+  url="${url_arg}"
+  if [[ -n "${row}" ]]; then
+    local r u
+    r="${row%%|*}"; u="${row#*|}"
+    [[ -z "${room}" ]] && room="${r}"
+    [[ -z "${url}" ]] && url="${u%%|*}"
+  fi
+  [[ -n "${room}" ]] || room="unknown"
+  [[ -n "${url}" ]] || url="unknown"
+  # комната идёт в карантин/удаление и в SQL — нормализуем в slug
+  [[ "${room}" == "unknown" ]] || room="$(slugify "${room}")"
+
+  echo "==> Сканирование: ${real_path}"
+  echo "    комната:  ${room}"
+  echo "    источник: ${url}"
+
+  local out virus
+  out="$(clamscan --no-summary "${real_path}" 2>&1)"
+  if echo "${out}" | grep -qi "FOUND"; then
+    virus="$(echo "${out}" | grep -i found | head -n1 | sed 's/.*: \([^:]*\) FOUND/\1/' | xargs)"
+    echo
+    echo "!!! ВИРУС ОБНАРУЖЕН: ${virus:-?}"
+    echo "    файл:     ${real_path}"
+    echo "    комната:  ${room}"
+    echo "    источник: ${url}"
+    sqlite3 "${SG_DB}" "UPDATE downloads SET status='infected' WHERE path='$(sg_esc "${real_path}")';"
+    sg_event "virus" "Вирус ${virus:-?} в ${real_path} (источник: ${url}, комната: ${room})."
+    echo
+
+    if [[ ${yes} -eq 1 ]]; then
+      [[ "${url}" != "unknown" ]] && sg_block_url "${url}" "${virus:-unknown}"
+      if [[ "${room}" != "unknown" ]]; then
+        echo "==> карантин комнаты «${room}»..."
+        sg_quarantine_room "${room}" "найден вирус ${virus:-?}"
+      fi
+      exit 0
+    fi
+
+    # 1) блокировка источника (решение пользователя)
+    if [[ "${url}" != "unknown" ]] && [[ -t 0 ]]; then
+      read -r -p "Заблокировать источник «${url}»? [Y/n] " a
+      [[ "${a}" =~ ^[Nn] ]] || sg_block_url "${url}" "${virus:-unknown}"
+    fi
+
+    # 2) карантин или удаление комнаты (решение пользователя)
+    if [[ "${room}" != "unknown" ]]; then
+      echo
+      echo "Комната «${room}» могла быть заражена. Ваш выбор:"
+      echo "  1) карантин — остановить процессы и запечатать данные комнаты"
+      echo "  2) удалить комнату полностью (все данные комнаты будут стёрты)"
+      echo "  3) оставить как есть"
+      read -r -p "Выбор [1/2/3] (по умолчанию 1): " a
+      case "${a}" in
+        2) sg_delete_room "${room}" ;;
+        3) echo "Оставлено как есть. Позже можно: sudo sg-av quarantine ${room}" ;;
+        *) sg_quarantine_room "${room}" "найден вирус ${virus:-?}" ;;
+      esac
+    fi
+    exit 0
+  fi
+
+  sqlite3 "${SG_DB}" "UPDATE downloads SET status='clean' WHERE path='$(sg_esc "${real_path}")';"
+  echo "✓ чисто: ${real_path}"
+  exit 0
+}
+
+# ---------------------------------------------------------------------------
+# плановое сканирование всех комнат (еженедельный таймер sg-av-scan.timer)
+scan_rooms() {
+  local yes=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes)  yes=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) echo "error: неизвестный флаг: $1" >&2; exit 1 ;;
+    esac
+  done
+  if ! command -v clamscan >/dev/null 2>&1; then
+    echo "!! ClamAV не установлен (sudo pacman -S clamav && sudo freshclam)" >&2
+    exit 2
+  fi
+  sg_ensure_db
+  local slug rtype home out line path virus row u
+  while IFS='|' read -r slug rtype; do
+    [[ -n "${slug}" ]] || continue
+    home="$(sg_room_home "${slug}")"
+    [[ -d "${home}" ]] || continue
+    echo "==> сканирование комнаты «${slug}» (${home})..."
+    out="$(clamscan -r --no-summary --max-filesize=25M --max-scansize=50M "${home}" 2>&1)"
+    if echo "${out}" | grep -qiE "LibClamAV|Can't open|ERROR"; then
+      echo "   ⚠ база сигнатур ClamAV, похоже, ещё не загружена (freshclam). Пропускаю."
+      continue
+    fi
+    local room_found=0
+    while IFS= read -r line; do
+      [[ -n "${line}" ]] || continue
+      if [[ "${line}" =~ ^(.*):\ ([^:]+)\ FOUND$ ]]; then
+        path="${BASH_REMATCH[1]}"
+        virus="${BASH_REMATCH[2]}"
+        room_found=$((room_found + 1))
+        echo "   !!! ${virus} : ${path}"
+        sqlite3 "${SG_DB}" "UPDATE downloads SET status='infected' WHERE path='$(sg_esc "${path}")';"
+        # источник загрузки ищем по имени файла (сканируем приватный home комнаты)
+        row="$(sqlite3 -separator '|' "${SG_DB}" \
+          "SELECT room,source_url FROM downloads WHERE filename='$(sg_esc "$(basename "${path}")")' ORDER BY id DESC LIMIT 1;" 2>/dev/null)"
+        if [[ -n "${row}" ]]; then
+          u="${row#*|}"
+          [[ "${u}" == "unknown" ]] || sg_block_url "${u}" "${virus}"
+        fi
+        sg_event "virus" "Плановое сканирование: ${virus} в ${path} (комната: ${slug})."
+      fi
+    done <<< "${out}"
+    if [[ ${yes} -eq 1 && ${room_found} -gt 0 ]]; then
+      echo "==> авто-карантин комнаты «${slug}»..."
+      sg_quarantine_room "${slug}" "плановое сканирование: ${room_found} заражённых файлов"
+    fi
+  done < <(sqlite3 -separator '|' "${SG_DB}" \
+    "SELECT id,type FROM rooms WHERE status NOT IN ('quarantined','deleted');" 2>/dev/null)
+  echo "✓ плановое сканирование завершено."
+  exit 0
+}
+
+# ---------------------------------------------------------------------------
+# поведенческий сторож: майнер / fork-бомба / упор в RAM (без сигнатур)
+watch() {
+  local interval="${SG_WATCH_INTERVAL:-10}" cpu_limit="${SG_WATCH_CPU_LIMIT:-250}" \
+        hits_needed="${SG_WATCH_HITS:-5}" mem_pct="${SG_WATCH_MEM_PCT:-90}" auto_q=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --interval)       interval="${2:?}"; shift 2 ;;
+      --cpu-limit)      cpu_limit="${2:?}"; shift 2 ;;
+      --hits)           hits_needed="${2:?}"; shift 2 ;;
+      --auto-quarantine) auto_q=1; shift ;;
+      -h|--help)        usage; exit 0 ;;
+      *) echo "error: неизвестный флаг: $1" >&2; exit 1 ;;
+    esac
+  done
+  [[ "${interval}" =~ ^[0-9]+$ && "${interval}" -gt 0 ]] || interval=10
+  [[ "${cpu_limit}" =~ ^[0-9]+$ ]] || cpu_limit=250
+  [[ "${hits_needed}" =~ ^[0-9]+$ && "${hits_needed}" -gt 0 ]] || hits_needed=5
+
+  sg_ensure_db 2>/dev/null || true
+  local -A prev_cpu=() hits=()
+  echo "== SafeGuard watchdog: интервал ${interval}s, CPU-порог ${cpu_limit}% (${hits_needed} проверок подряд), авто-карантин: $([ ${auto_q} -eq 1 ] && echo ДА || echo нет)"
+  echo "   Ctrl+C для остановки. События: sg-av status / журнал SafeGuard."
+  while true; do
+    local units=""
+    units="$(systemctl list-units --type=scope --no-legend --plain 2>/dev/null | awk '$1 ~ /^sg-/ {print $1}')"
+    for u in ${units}; do
+      local slug="${u%.scope}"
+      local cur_ns prev_ns cpu_now mem_cur mem_max tasks tasksmax
+      cur_ns="$(systemctl show "${u}" -p CPUUsageNSec --value 2>/dev/null)"
+      prev_ns="${prev_cpu[${slug}]:-}"
+      mem_cur="$(systemctl show "${u}" -p MemoryCurrent --value 2>/dev/null)"
+      mem_max="$(systemctl show "${u}" -p MemoryMax --value 2>/dev/null)"
+      tasks="$(systemctl show "${u}" -p TasksCurrent --value 2>/dev/null)"
+      tasksmax="$(systemctl show "${u}" -p TasksMax --value 2>/dev/null)"
+      cpu_now=0
+      if [[ -n "${cur_ns}" && -n "${prev_ns}" ]]; then
+        local dns=$(( cur_ns - prev_ns ))
+        [[ ${dns} -lt 0 ]] && dns=0
+        cpu_now=$(( dns / interval / 10000000 ))   # % одного ядра
+      fi
+      prev_cpu[${slug}]="${cur_ns:-0}"
+      # --- майнер/DoS: устойчивая нагрузка выше порога ---
+      if [[ ${cpu_now} -ge ${cpu_limit} ]]; then
+        hits[${slug}]=$(( ${hits[${slug}]:-0} + 1 ))
+      else
+        hits[${slug}]=0
+      fi
+      if [[ ${hits[${slug}]:-0} -ge ${hits_needed} ]]; then
+        local msg="Подозрение на майнинг/DoS: комната «${slug}» держит CPU ${cpu_now}% (${hits_needed} проверок подряд)."
+        echo "[$(date '+%F %T')] ⚠ ${msg}"
+        sg_event "miner-suspect" "${msg}"
+        hits[${slug}]=0
+        if [[ ${auto_q} -eq 1 ]]; then
+          echo "==> авто-карантин комнаты «${slug}»..."
+          sg_quarantine_room "${slug}" "watchdog: устойчивая CPU-нагрузка ${cpu_now}%"
+        fi
+      fi
+      # --- упор в лимит RAM (memory-exhaust / утечка) ---
+      if [[ -n "${mem_cur}" && -n "${mem_max}" \
+            && "${mem_max}" != "18446744073709551615" && "${mem_cur}" != "18446744073709551615" ]]; then
+        local pct=$(( mem_cur * 100 / mem_max ))
+        if [[ ${pct} -ge ${mem_pct} ]]; then
+          local mmsg="Комната «${slug}» у лимита RAM: ${pct}% (возможен memory-exhaust-эксплойт)."
+          echo "[$(date '+%F %T')] ⚠ ${mmsg}"
+          sg_event "mem-pressure" "${mmsg}"
+        fi
+      fi
+      # --- fork-бомба: почти весь TasksMax занят ---
+      if [[ -n "${tasks}" && -n "${tasksmax}" \
+            && "${tasksmax}" != "18446744073709551615" && "${tasksmax}" -gt 0 ]]; then
+        if [[ ${tasks} -ge $(( tasksmax * 90 / 100 )) ]]; then
+          local fmsg="Fork-бомба? Комната «${slug}»: ${tasks} процессов из лимита ${tasksmax}."
+          echo "[$(date '+%F %T')] ⚠ ${fmsg}"
+          sg_event "forkbomb-suspect" "${fmsg}"
+        fi
+      fi
+    done
+    sleep "${interval}"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+live() {
+  local units u
+  units="$(systemctl list-units --type=scope --no-legend --plain 2>/dev/null | awk '$1 ~ /^sg-/ {print $1}')"
+  if [[ -z "${units}" ]]; then
+    echo "Нет запущенных комнат. Запустите: sudo sg-room-run browser -- firefox"
+    exit 0
+  fi
+  printf '%-28s %-18s %-10s %-10s\n' "КОМНАТА" "RAM (тек/лимит)" "CPU-квота" "CPU, сек"
+  while IFS= read -r u; do
+    local mem_cur mem_max quota cpu_sec
+    mem_cur="$(systemctl show "${u}" -p MemoryCurrent --value 2>/dev/null)"
+    mem_max="$(systemctl show "${u}" -p MemoryMax --value 2>/dev/null)"
+    quota="$(systemctl show "${u}" -p CPUQuotaPerSecUSec --value 2>/dev/null)"
+    cpu_sec="$(systemctl show "${u}" -p CPUUsageNSec --value 2>/dev/null)"
+    [[ -n "${mem_cur}" && "${mem_cur}" != "18446744073709551615" ]] && mem_cur="$(numfmt --to=iec "${mem_cur}")" || mem_cur="0"
+    if [[ -n "${mem_max}" && "${mem_max}" != "18446744073709551615" ]]; then
+      mem_max="$(numfmt --to=iec "${mem_max}")"
+    else
+      mem_max="нет"
+    fi
+    if [[ -n "${quota}" && "${quota}" != "18446744073709551615" ]]; then
+      quota="$((quota / 10000))%"
+    else
+      quota="нет"
+    fi
+    [[ -n "${cpu_sec}" ]] && cpu_sec="$((cpu_sec / 1000000000))" || cpu_sec="0"
+    printf '%-28s %-18s %-10s %-10s\n' "${u%.scope}" "${mem_cur}/${mem_max}" "${quota}" "${cpu_sec}"
+  done <<< "${units}"
+  echo
+  echo "подсказка: sg-av live показывает только комнаты, запущенные через sg-room-run"
+  exit 0
+}
+
+# ---------------------------------------------------------------------------
+status() {
+  local room="${1:-}"
+  sg_ensure_db 2>/dev/null || true
+  echo "== Загрузки (источники вирусов запоминаются здесь) =="
+  if [[ -n "${room}" ]]; then
+    sqlite3 -separator ' | ' "${SG_DB}" \
+      "SELECT id,room,filename,source_url,status,datetime(time,'unixepoch') FROM downloads WHERE room='$(sg_esc "${room}")' ORDER BY id DESC LIMIT 50;" 2>/dev/null
+  else
+    sqlite3 -separator ' | ' "${SG_DB}" \
+      "SELECT id,room,filename,source_url,status,datetime(time,'unixepoch') FROM downloads ORDER BY id DESC LIMIT 50;" 2>/dev/null
+  fi
+  [[ -z "$(sqlite3 "${SG_DB}" 'SELECT 1 FROM downloads LIMIT 1;' 2>/dev/null)" ]] && echo "(нет записей — фиксируйте загрузки: sg-track ФАЙЛ --url URL)"
+  echo
+  echo "== Заблокированные источники =="
+  local blocks
+  blocks="$(sqlite3 -separator ' | ' "${SG_DB}" \
+    "SELECT host,virus,datetime(time,'unixepoch'),CASE unblocked WHEN 1 THEN 'разблокирован' ELSE 'АКТИВЕН' END FROM blocked ORDER BY time DESC;" 2>/dev/null)"
+  [[ -n "${blocks}" ]] && printf '%s\n' "${blocks}" || echo "(нет блокировок)"
+  echo
+  echo "== Карантин =="
+  ls -1 "${SG_QUARANTINE}" 2>/dev/null || echo "(пусто)"
+  exit 0
+}
+
+# ---------------------------------------------------------------------------
+[[ $EUID -eq 0 ]] || { echo "error: запустите от root: sudo sg-av ..." >&2; exit 1; }
+
+cmd="${1:-status}"
+shift || true
+case "${cmd}" in
+  scan)       scan "$@" ;;
+  scan-rooms) scan_rooms "$@" ;;
+  live)       live ;;
+  watch)      watch "$@" ;;
+  status|list) status "${1:-}" ;;
+  block)      sg_ensure_db; [[ $# -ge 1 ]] || { echo "usage: sg-av block URL [virus]" >&2; exit 1; }
+              sg_block_url "$1" "${2:-user}" ;;
+  unblock)    sg_ensure_db; [[ $# -ge 1 ]] || { echo "usage: sg-av unblock URL" >&2; exit 1; }
+              sg_unblock_url "$1" ;;
+  quarantine) sg_ensure_db; [[ $# -ge 1 ]] || { echo "usage: sg-av quarantine ROOM [причина]" >&2; exit 1; }
+              sg_quarantine_room "$(slugify "$1")" "${2:-вручную}" ;;
+  restore)    sg_ensure_db; [[ $# -ge 1 ]] || { echo "usage: sg-av restore ROOM" >&2; exit 1; }
+              sg_restore_room "$(slugify "$1")" ;;
+  delete)     sg_ensure_db; [[ $# -ge 1 ]] || { echo "usage: sg-av delete ROOM" >&2; exit 1; }
+              sg_delete_room "$(slugify "$1")" ;;
+  -h|--help)  usage; exit 0 ;;
+  *)          echo "error: неизвестная команда: ${cmd}" >&2; usage >&2; exit 1 ;;
+esac

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Установить safegamingOS
+Comment=Установить safegamingOS на диск (стирает выбранный диск!)
+Exec=sg-install-gui
+Icon=drive-harddisk
+Terminal=false
+Categories=System;

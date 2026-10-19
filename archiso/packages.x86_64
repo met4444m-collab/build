@@ -1,0 +1,104 @@
+# safegamingOS live ISO packages
+# --- base / kernel ---
+base
+linux
+linux-firmware
+intel-ucode
+amd-ucode
+mkinitcpio
+mkinitcpio-archiso
+# --- boot / disk tools (installer) ---
+arch-install-scripts
+syslinux
+grub
+efibootmgr
+parted
+gptfdisk
+dosfstools
+e2fsprogs
+btrfs-progs
+xfsprogs
+ntfs-3g
+exfatprogs
+f2fs-tools
+mdadm
+# --- network ---
+networkmanager
+iwd
+wpa_supplicant
+wireless-regdb
+# --- boot splash ---
+plymouth
+# --- desktop (KDE Plasma 6) ---
+plasma-meta
+plasma-nm
+plasma-pa
+sddm
+sddm-kcm
+kscreen
+konsole
+dolphin
+kate
+gwenview
+spectacle
+xdg-utils
+xdg-user-dirs
+xdg-desktop-portal
+xdg-desktop-portal-kde
+power-profiles-daemon
+# --- fonts ---
+ttf-dejavu
+noto-fonts
+noto-fonts-cjk
+# --- sound / video ---
+pipewire
+pipewire-pulse
+pipewire-alsa
+wireplumber
+alsa-utils
+sof-firmware
+# --- GPU drivers (auto-detected: Intel + AMD) ---
+mesa
+libva-intel-driver
+intel-media-driver
+vulkan-intel
+vulkan-radeon
+libva-utils
+# --- games / streaming ---
+obs-studio
+prismlauncher
+jre-openjdk
+firefox
+firejail
+# --- X11-изоляция комнат (sg-room-run --x11-isolate) + XWayland
+#     (X11-приложения внутри Wayland-сессии: игры, Wine) ---
+xorg-server-xephyr
+xorg-xauth
+xorg-xwayland
+# --- host firewall (вход по умолчанию закрыт) ---
+nftables
+# --- SafeGuard (rooms, AV, tracking) ---
+sqlite
+inotify-tools
+python
+apparmor
+# --- SafeGuard GUI ---
+python-pyqt6
+polkit
+polkit-kde-agent
+# --- installer ---
+dialog
+# --- utilities ---
+sudo
+vim
+man-db
+man-pages
+git
+curl
+wget
+reflector
+rsync
+openssh
+# --- auto-update (sg-update) ---
+libnotify
+jq

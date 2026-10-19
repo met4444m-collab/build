@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# safegamingOS — запустить стандартное приложение в комнате одним кликом
+# (иконки рабочего стола и меню). Привилегии через pkexec (wheel — без пароля).
+#
+# Usage: sg-open browser|games|streaming
+set -uo pipefail
+
+room="${1:-browser}"
+
+case "${room}" in
+  browser)   app="firefox"       flags=() ;;
+  games)     app="prismlauncher" flags=(--game) ;;
+  streaming) app="obs"           flags=(--game) ;;
+  *) echo "usage: sg-open browser|games|streaming" >&2; exit 1 ;;
+esac
+
+exec pkexec /usr/local/bin/sg-room-run "${flags[@]}" "${room}" -- "${app}"

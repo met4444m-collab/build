@@ -1,0 +1,18 @@
+{
+  "policies": {
+    "Homepage": {
+      "URL": "file:///usr/share/safegamingos/welcome.html",
+      "Locked": false
+    },
+    "NewTabPage": false,
+    "DisableTelemetry": true,
+    "OfferToSaveLogins": false,
+    "DisableFirefoxAccounts": true,
+    "DisablePocket": true,
+    "BlockAboutConfig": true,
+    "DNSOverHTTPS": {
+      "Enabled": false,
+      "Locked": true
+    }
+  }
+}

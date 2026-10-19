@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=SafeGuard Download Guard
+Comment=Следит за папкой загрузок и блокирует запуск новых файлов до подтверждения
+Exec=/usr/local/bin/sg-download-guard.py
+Terminal=false
+X-GNOME-Autostart-enabled=true

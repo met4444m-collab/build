@@ -1,0 +1,597 @@
+#!/usr/bin/env bash
+# safegamingOS — root installer helper (invoked via pkexec from sg-install-gui).
+# Performs the full install WITHOUT archinstall: GPT partitioning, format,
+# pacstrap, chroot configuration, branding, SafeGuard, swapfile.
+#
+# Usage: sg-install-run /path/to/config
+# The config is a shell snippet with: DISK= HOSTNAME= USERNAME= PASS= SWAP_GB= WINE=0|1
+# Progress is written to /tmp/sg-install.log as:
+#   PROGRESS:<0-100>|<message>   — step update
+#   ERROR|<message>              — fatal error
+#   DONE|<message>               — finished successfully
+set -uo pipefail
+
+CONF="${1:?usage: sg-install-run /path/to/config}"
+LOG=/tmp/sg-install.log
+: > "$LOG"
+chmod 644 "$LOG" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# ТЕСТОВЫЙ РЕЖИМ: SG_INSTALL_TEST=1
+# Диском может быть обычный ФАЙЛ (виртуальный диск). Установщик выполняет
+# полную очистку + GPT-разметку + проверку таблицы и завершается ДО pacstrap/
+# chroot — так логику разметки можно проверять в песочнице без root и без
+# VirtualBox, на файле с заранее «испорченной» старой GPT.
+# ---------------------------------------------------------------------------
+TEST_MODE=0
+[[ "${SG_INSTALL_TEST:-}" == "1" ]] && TEST_MODE=1
+
+step() { echo "PROGRESS:$1|$2" >> "$LOG"; }
+die() { echo "ERROR|$*" >> "$LOG"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Безопасная загрузка конфига.
+#
+# Раньше здесь был `source "$CONF"` — конфиг писался GUI на ФИКСИРОВАННЫЙ путь
+# /tmp/sg-install.conf обычным пользователем (live), а root-помощник выполнял
+# его как шелл-код. Любой процесс пользователя сессии (включая браузерную
+# комнату — она работает от того же UID!) мог:
+#   1) подменить файл гонкой между записью GUI и запуском pkexec, или
+#   2) просто сам выполнить `pkexec sg-install-run /tmp/мой-конфиг`
+# (правило polkit разрешает wheel без пароля) — с произвольным шелл-кодом
+# внутри → ПОЛНЫЙ root-RCE.
+#
+# Теперь конфиг НИКОГДА не выполняется: только построчный разбор KEY=value,
+# строгая валидация каждого поля, проверка владельца и прав файла. Любая
+# строка, не являющаяся ожидаемой парой KEY=value — ошибка, а не исполнение.
+# ---------------------------------------------------------------------------
+[[ -f "$CONF" && ! -L "$CONF" ]] || die "конфиг не найден: $CONF"
+CONF="$(realpath "$CONF" 2>/dev/null || echo "$CONF")"
+# конфиг должен принадлежать реальному пользователю, который вызвал помощника
+# (pkexec: PKEXEC_UID; sudo: SUDO_USER), и не быть группово/общедоступно
+# записываемым — защита от чужой подмены файла.
+conf_owner="$(stat -c %u "$CONF" 2>/dev/null || echo -1)"
+conf_mode="$(stat -c %a "$CONF" 2>/dev/null || echo 777)"
+invoker="${PKEXEC_UID:-}"
+if [[ -z "${invoker}" ]]; then
+  invoker="$(id -u "${SUDO_USER:-root}" 2>/dev/null || echo 0)"
+fi
+[[ "${invoker}" =~ ^[0-9]+$ ]] || invoker=0
+if [[ "${conf_owner}" != "${invoker}" && "${conf_owner}" != "0" ]]; then
+  die "конфиг принадлежит другому пользователю — отмена"
+fi
+# ПРАВА: битовая маска — ВАЖНО явное основание 8#. bash парсит «600» как
+# ДЕСЯТИЧНОЕ (нет ведущего нуля), а «022» как восьмеричное → $(( 600 & 022 ))
+# = 16 ≠ 0, и проверка падала на любом конфиге, даже идеальном 0600 (баг
+# жил с v0.9.8; реальный отказ «конфиг не должен быть записываемым…»).
+# 8#600 = 384, 8#022 = 18, 384 & 18 = 0 → корректно проходит.
+# Права затягиваем до 600 (мы root): это чинит случайные 664/666. Безопасно:
+# владелец уже проверен выше, конфиг по-прежнему НЕ выполняется (только
+# строгий разбор KEY=value с валидацией), а ужесточение прав делает файл
+# только менее доступным. Если ФС вообще не хранит права (vfat) — chmod
+# молча не сработает, stat покажет это снова, и мы откажемся ниже.
+if [[ $(( 8#${conf_mode} & 8#022 )) -ne 0 ]]; then
+  chmod 600 "$CONF" 2>/dev/null || true
+  conf_mode="$(stat -c %a "$CONF" 2>/dev/null || echo 777)"
+fi
+if [[ $(( 8#${conf_mode} & 8#022 )) -ne 0 ]]; then
+  die "конфиг не должен быть записываемым для группы/всех (права ${conf_mode}) — отмена"
+fi
+step 0 "Читаю конфиг: ${CONF}"
+
+# --- строгий разбор KEY=value (никакого source/eval) ---
+DISK="" HOSTNAME="" USERNAME="" PASS="" SWAP_GB="" WINE=""
+while IFS= read -r _line; do
+  [[ -n "${_line}" ]] || continue
+  # только печатные символы, никаких переводов строк/управляющих кодов
+  [[ "${_line}" == *[![:print:]]* ]] && die "конфиг: недопустимые символы в строке"
+  case "${_line}" in
+    DISK=*|HOSTNAME=*|USERNAME=*|PASS=*|SWAP_GB=*|WINE=*) ;;
+    *) die "конфиг: неизвестная строка: ${_line%%=*}" ;;
+  esac
+  _key="${_line%%=*}"
+  _val="${_line#*=}"
+  # Значения пишутся одинарными кавычками (shell_quote в sg-install, shq в GUI).
+  # Снимаем кавычки БЕЗ eval. Экранированная кавычка внутри значения — это
+  # '\'' (bash-стиль) или "'" (Python shlex-стиль: закрывающая кавычка
+  # сегмента + "'" + открывающая, т.е. 4 символа '""'). Всё остальное —
+  # данные как есть.
+  if [[ "${_val:0:1}" == "'" ]]; then
+    _val="${_val:1}"
+    _decoded=""
+    while [[ -n "${_val}" ]]; do
+      # bash-стиль: '\''  (4 символа: ' \ ' ' — закрывающая + escape)
+      if [[ "${_val:0:4}" == "'\\''" ]]; then
+        _decoded+="'"
+        _val="${_val:4}"
+      # shlex-стиль: '""'  (4 символа: ' " ' " — закрывающая + escape)
+      elif [[ "${_val:0:4}" == $'\'\"\'\"' ]]; then
+        _decoded+="'"
+        _val="${_val:4}"
+      elif [[ "${_val:0:1}" == "'" ]]; then
+        # граница сегмента: shlex/shell_quote склеивают сегменты '...' подряд,
+        # кавычка между ними — это разделитель, НЕ конец значения
+        _val="${_val:1}"
+      else
+        _decoded+="${_val:0:1}"
+        _val="${_val:1}"
+      fi
+    done
+    _val="${_decoded}"
+  fi
+  case "${_key}" in
+    DISK)     DISK="${_val}" ;;
+    HOSTNAME) HOSTNAME="${_val}" ;;
+    USERNAME) USERNAME="${_val}" ;;
+    PASS)     PASS="${_val}" ;;
+    SWAP_GB)  SWAP_GB="${_val}" ;;
+    WINE)     WINE="${_val}" ;;
+  esac
+done < "$CONF"
+rm -f "$CONF"
+
+# --- строгая валидация значений (данные, не код) ---
+[[ -n "${DISK}" && -n "${HOSTNAME}" && -n "${USERNAME}" && -n "${PASS}" ]] \
+  || die "конфиг: не хватает полей (DISK/HOSTNAME/USERNAME/PASS)"
+if [[ "${TEST_MODE}" -eq 1 ]]; then
+  [[ -f "$DISK" ]] || die "тестовый диск-файл не найден: $DISK"
+else
+  [[ "$DISK" =~ ^/dev/[a-zA-Z0-9]+$ ]] || die "неверный путь диска: $DISK"
+  [[ -b "$DISK" ]] || die "диск не найден: $DISK"
+  # диск должен быть ЦЕЛЫМ диском, а не разделом
+  [[ "$(lsblk -dno TYPE "$DISK" 2>/dev/null)" == "disk" ]] \
+    || die "указан не целый диск: $DISK (нужен /dev/sda, /dev/nvme0n1 и т.п.)"
+fi
+# Если разделы этого диска смонтированы от предыдущей неудачной попытки —
+# размонтируем (сначала потомков, потом корень), чтобы parted/mkfs не падали.
+# Если это РЕАЛЬНЫЙ корень текущей системы — отказываемся (защита от стирания
+# рабочей системы).
+_mounted_parts=""
+if [[ "${TEST_MODE}" -eq 0 ]]; then
+  _mounted_parts=$(mount 2>/dev/null | grep -oE "^${DISK}[p0-9]*" || true)
+fi
+if [[ -n "${_mounted_parts}" ]]; then
+  # Проверяем, не является ли один из смонтированных разделов текущим корнем
+  _root_dev=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+  if echo "${_mounted_parts}" | grep -q "^${_root_dev%%[0-9]*}"; then
+    die "диск $DISK содержит корень текущей системы — отмена"
+  fi
+  step 1 "Размонтирую остатки предыдущей попытки..."
+  # Размонтируем потомков раньше родителей (boot перед root)
+  umount -Rl /mnt 2>/dev/null || true
+  # Также пробуем размонтировать конкретные разделы
+  for _p in ${_mounted_parts}; do
+    umount -l "${_p}" 2>/dev/null || true
+  done
+  udevadm settle 2>/dev/null || sleep 1
+fi
+[[ "$HOSTNAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$ ]] \
+  || die "неверное имя компьютера: $HOSTNAME"
+[[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]{2,31}$ ]] \
+  || die "неверное имя пользователя: $USERNAME"
+[[ "$PASS" != *$'\n'* && "$PASS" != *$'\r'* ]] || die "недопустимый пароль"
+[[ "$SWAP_GB" =~ ^[0-9]+$ ]] || SWAP_GB=16
+[[ "$WINE" == "0" || "$WINE" == "1" ]] || WINE=0
+
+TARGET=/mnt
+cleanup() { umount -R "$TARGET" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+
+# handle nvme/mmcblk partition naming
+case "$DISK" in
+  *nvme*|*mmcblk*|*loop*) ESP="${DISK}p1"; ROOT="${DISK}p2" ;;
+  *) ESP="${DISK}1"; ROOT="${DISK}2" ;;
+esac
+
+# ---------------------------------------------------------------------------
+step 2 "Разметка диска $DISK (GPT). Весь диск будет стёрт..."
+
+# --- Шаг А: Размонтируем всё что держит диск ---
+for _lp in $(losetup -j "$DISK" 2>/dev/null | cut -d: -f1); do
+  losetup -d "$_lp" 2>/dev/null || true
+done
+for _p in $(lsblk -lnpo NAME "$DISK" 2>/dev/null | tail -n +2); do
+  umount -l "$_p" 2>/dev/null || true
+done
+umount -Rl /mnt 2>/dev/null || true
+udevadm settle 2>/dev/null || sleep 2
+
+# --- Шаг Б: Полное обнуление первых 2 МБ и последних 2 МБ диска ---
+# Это стирает GPT header (LBA 1) и backup GPT (конец диска)
+# bs=1M count=2 = 2 МБ — быстрее чем обнулять весь диск
+if [[ "${TEST_MODE}" -eq 1 ]]; then
+  osize_bytes=$(stat -c %s "$DISK" 2>/dev/null || echo 0)
+else
+  osize_bytes=$(lsblk -dbno SIZE "$DISK" 2>/dev/null | head -1)
+fi
+dd if=/dev/zero of="$DISK" bs=1M count=2 conv=fsync 2>/dev/null || true
+if [[ -n "${osize_bytes}" && "${osize_bytes}" -gt 2097152 ]]; then
+  # Последние 2 МБ диска: seek = (размер - 2МБ) / 1МБ
+  _last_mib=$(( (osize_bytes - 2097152) / 1048576 ))
+  dd if=/dev/zero of="$DISK" bs=1M seek="${_last_mib}" count=2 conv=fsync 2>/dev/null || true
+fi
+
+# --- Шаг В: Очищаем signatures (wipefs) и GPT (sgdisk) ---
+command -v wipefs >/dev/null 2>&1 && wipefs -a "$DISK" 2>/dev/null || true
+command -v sgdisk >/dev/null 2>&1 && sgdisk --zap-all "$DISK" 2>/dev/null || true
+
+# --- Шаг Г: Ядро перечитывает таблицу ---
+blockdev --rereadpt "$DISK" 2>/dev/null || true
+partprobe "$DISK" 2>/dev/null || true
+udevadm settle 2>/dev/null || sleep 3
+
+# --- Шаг Д: Создаём GPT + разделы через sfdisk (самый надёжный метод) ---
+# sfdisk — часть util-linux, ВСЕГДА доступен. Он напрямую пишет таблицу
+# разделов в MBR/GPT, НЕ зависит от backup GPT и не проверяет "有意思".
+step 2 "Создаю GPT-разметку через sfdisk..."
+
+# Определяем размер диска в секторах (512 байт)
+if [[ "${TEST_MODE}" -eq 1 ]]; then
+  disk_sectors=$(( $(stat -c %s "$DISK") / 512 ))
+else
+  disk_sectors=$(blockdev --getsz "$DISK" 2>/dev/null || echo 0)
+fi
+
+# ESP = 512 МБ = 1048576 секторов, начинается с сектора 2048 (1 МиБ)
+esp_start=2048
+esp_size=1048576
+root_start=$(( esp_start + esp_size ))
+root_size=$(( disk_sectors - root_start - 34 ))  # 34 сектора резерва для backup GPT
+
+if [[ "${disk_sectors}" -lt 2099200 ]]; then
+  die "диск слишком маленький для установки ($(lsblk -dno SIZE "$DISK" 2>/dev/null))"
+fi
+
+# sfdisk: перезаписывает таблицу разделов ПРЯМО — не зависит от того
+# что было на диске ранее. Формат: <старт>:<размер>, type=<GUID>
+printf 'label: gpt\nunit: sectors\n\n%s1 : start=%d, size=%d, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B\n%s2 : start=%d, size=%d, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4\n' \
+  "$DISK" "$esp_start" "$esp_size" \
+  "$DISK" "$root_start" "$root_size" \
+  | sfdisk --no-reread --no-tell-kernel "$DISK"
+sfdisk_rc=$?
+
+# Если sfdisk не сработал — пробуем parted как fallback
+if [[ $sfdisk_rc -ne 0 ]]; then
+  step 2 "sfdisk не сработал, пробую parted..."
+  # Полное обнуление перед parted
+  dd if=/dev/zero of="$DISK" bs=1M count=2 conv=fsync 2>/dev/null || true
+  dd if=/dev/zero of="$DISK" bs=1M seek="$(( (osize_bytes - 2097152) / 1048576 ))" count=2 conv=fsync 2>/dev/null || true
+  blockdev --rereadpt "$DISK" 2>/dev/null || true
+  sleep 2
+  parted -s "$DISK" mklabel gpt \
+    && parted -s "$DISK" mkpart ESP fat32 1MiB 513MiB \
+    && parted -s "$DISK" set 1 esp on \
+    && parted -s "$DISK" mkpart root ext4 513MiB 100% \
+    || die "sfdisk и parted оба не смогли создать разметку на $DISK"
+fi
+
+udevadm settle 2>/dev/null || sleep 2
+
+# --- Шаг Е (только ТЕСТ): проверяем таблицу и выходим до монтирования ---
+if [[ "${TEST_MODE}" -eq 1 ]]; then
+  if ! sfdisk -d "$DISK" 2>/dev/null | grep -q "$DISK"; then
+    die "TEST: таблица разделов не читается после разметки ($DISK)"
+  fi
+  _nparts=$(sfdisk -d "$DISK" 2>/dev/null | grep -cE "${DISK}[12] ?:")
+  [[ "${_nparts}" -ge 2 ]] || die "TEST: ожидалось 2 раздела, найдено ${_nparts}"
+  step 100 "ТЕСТ ПРОЙДЕН: GPT + 2 раздела созданы на виртуальном диске"
+  echo "DONE|TEST OK: разметка $DISK создана, таблица валидна (разделов: ${_nparts})."
+  exit 0
+fi
+
+# --- Шаг Е: Проверяем что разделы созданы ---
+if ! lsblk -lnpo NAME,TYPE "$DISK" 2>/dev/null | grep -q 'part'; then
+  die "разделы не появились после разметки ($DISK)"
+fi
+if [[ ! -b "$ESP" || ! -b "$ROOT" ]]; then
+  # Обновляем пути на случай если sfdisk нумерует иначе
+  _parts=($(lsblk -lnpo NAME,TYPE "$DISK" 2>/dev/null | awk '$2=="part"{print $1}'))
+  ESP="${_parts[0]:-$ESP}"
+  ROOT="${_parts[1]:-$ROOT}"
+  [[ -b "$ESP" && -b "$ROOT" ]] || die "разделы не созданы: ESP=$ESP ROOT=$ROOT"
+fi
+
+step 4 "Форматирование разделов..."
+mkfs.fat -F32 "$ESP" >/dev/null 2>&1 || die "не удалось отформатировать ESP ($ESP)"
+mkfs.ext4 -F "$ROOT" >/dev/null 2>&1 || die "не удалось отформатировать корневой раздел ($ROOT)"
+
+step 6 "Монтирование..."
+mkdir -p "$TARGET"
+mount "$ROOT" "$TARGET" || die "не удалось смонтировать корневой раздел"
+mkdir -p "$TARGET/boot"
+mount "$ESP" "$TARGET/boot" || die "не удалось смонтировать ESP"
+
+step 8 "Копирование брендинга safegamingOS..."
+mkdir -p "$TARGET/usr/share/plymouth/themes" "$TARGET/usr/share/wallpapers" \
+         "$TARGET/usr/local/bin" "$TARGET/usr/local/lib/sg-rooms" \
+         "$TARGET/etc/polkit-1/rules.d" "$TARGET/etc/sysctl.d" \
+         "$TARGET/usr/share/applications" "$TARGET/etc/skel/Desktop" \
+         "$TARGET/etc/skel/.config/autostart" "$TARGET/etc/skel/.config/systemd/user" \
+         "$TARGET/usr/lib/systemd/system" \
+         "$TARGET/usr/share/color-schemes" "$TARGET/usr/share/konsole" \
+         "$TARGET/etc/firefox/policies" "$TARGET/usr/share/safegamingos" \
+         "$TARGET/usr/share/sddm/themes/breeze"
+cp -r /usr/share/plymouth/themes/safegamingos "$TARGET/usr/share/plymouth/themes/" 2>/dev/null || true
+cp /usr/share/wallpapers/safegamingos.png "$TARGET/usr/share/wallpapers/" 2>/dev/null || true
+cp /usr/share/sddm/themes/breeze/theme.conf.user "$TARGET/usr/share/sddm/themes/breeze/" 2>/dev/null || true
+cp /usr/share/color-schemes/safegamingOS.colors "$TARGET/usr/share/color-schemes/" 2>/dev/null || true
+cp /usr/share/konsole/safegamingOS.colorscheme /usr/share/konsole/safegamingOS.profile "$TARGET/usr/share/konsole/" 2>/dev/null || true
+cp /etc/skel/.config/konsolerc "$TARGET/etc/skel/.config/" 2>/dev/null || true
+cp /etc/firefox/policies/policies.json "$TARGET/etc/firefox/policies/" 2>/dev/null || true
+cp /usr/share/safegamingos/welcome.html "$TARGET/usr/share/safegamingos/" 2>/dev/null || true
+cp /usr/share/safegamingos/version "$TARGET/usr/share/safegamingos/" 2>/dev/null || true
+cp /usr/local/lib/sg-rooms/lib.sh "$TARGET/usr/local/lib/sg-rooms/lib.sh" 2>/dev/null || true
+cp /usr/local/bin/sg-* "$TARGET/usr/local/bin/" 2>/dev/null || true
+cp /etc/polkit-1/rules.d/49-safegamingos.rules "$TARGET/etc/polkit-1/rules.d/" 2>/dev/null || true
+cp /etc/sysctl.d/99-safegamingos.conf "$TARGET/etc/sysctl.d/" 2>/dev/null || true
+for f in safegamingos-gui.desktop sg-browser.desktop sg-games.desktop sg-streaming.desktop; do
+  cp "/usr/share/applications/$f" "$TARGET/usr/share/applications/" 2>/dev/null || true
+  cp "/usr/share/applications/$f" "$TARGET/etc/skel/Desktop/" 2>/dev/null || true
+done
+cp /etc/skel/.config/autostart/sg-wallpaper.desktop "$TARGET/etc/skel/.config/autostart/" 2>/dev/null || true
+cp /etc/skel/.config/autostart/sg-update.desktop "$TARGET/etc/skel/.config/autostart/" 2>/dev/null || true
+cp /etc/skel/.config/systemd/user/sg-update-check.service \
+   /etc/skel/.config/systemd/user/sg-update-check.timer \
+   "$TARGET/etc/skel/.config/systemd/user/" 2>/dev/null || true
+cp /usr/lib/systemd/system/sg-watch.service \
+   /usr/lib/systemd/system/sg-av-scan.service \
+   /usr/lib/systemd/system/sg-av-scan.timer \
+   /usr/lib/systemd/system/sg-track.service \
+   "$TARGET/usr/lib/systemd/system/" 2>/dev/null || true
+chmod +x "$TARGET"/usr/local/bin/sg-* 2>/dev/null || true
+
+# --- список пакетов установки: ЕДИНЫЙ источник (install-pkgs.conf). Тот же
+#     файл при сборке ISO предзагружает офлайн-набор в /opt/sg-offline, чтобы
+#     установка работала вообще без интернета. ---
+# shellcheck source=/dev/null
+source /usr/local/lib/sg-rooms/install-pkgs.conf 2>/dev/null || true
+INSTALL_PKGS="${INSTALL_PKGS:-base linux linux-firmware intel-ucode amd-ucode networkmanager iwd plymouth plasma-meta plasma-nm plasma-pa sddm sddm-kcm kscreen konsole dolphin kate gwenview spectacle xdg-utils xdg-user-dirs xdg-desktop-portal xdg-desktop-portal-kde power-profiles-daemon ttf-dejavu noto-fonts noto-fonts-cjk pipewire pipewire-pulse pipewire-alsa wireplumber alsa-utils sof-firmware mesa libva-intel-driver intel-media-driver vulkan-intel vulkan-radeon obs-studio prismlauncher jre-openjdk firefox firejail xorg-server xorg-server-xephyr xorg-xauth xorg-xwayland nftables sqlite inotify-tools python python-pyqt6 polkit polkit-kde-agent apparmor clamav dialog sudo vim git curl wget reflector rsync openssh grub efibootmgr acl}"
+
+# Офлайн-установка из набора, встроенного в ISO (/opt/sg-offline): пакеты +
+# базы репозиториев + keyring собраны при сборке ISO (build_iso.sh →
+# archiso/airootfs/opt/sg-offline). Работает полностью без интернета:
+# pacman -S ставит из кеша по локальным базам (без -y — версии ровно те,
+# что были на момент сборки ISO).
+#
+# ВАЖНО: перед установкой монтируем псевдо-ФС в таргет (как это делает
+# pacstrap). Без /proc, /sys, /dev install-скрипты и хуки пакетов
+# (linux → mkinitcpio, archlinux-keyring → pacman-key, grub и т.п.) падают
+# внутри chroot, и pacman прерывает транзакцию — так live-установка без
+# интернета падала с «сбой установки пакетов». Размонтирование — общий
+# cleanup() (umount -R) из trap.
+sg_offline_install() {
+  local t="$1"; shift
+  [[ -f /opt/sg-offline/READY && -d /opt/sg-offline/pkgs ]] || return 1
+  step 10 "Устанавливаю из офлайн-набора, встроенного в ISO..."
+  mkdir -p "$t/var/lib/pacman/sync" "$t/etc/pacman.d" \
+           "$t/proc" "$t/sys" "$t/dev/pts" "$t/dev/shm" "$t/run"
+  cp -a /opt/sg-offline/db/sync/. "$t/var/lib/pacman/sync/" 2>/dev/null || return 1
+  cp -a /opt/sg-offline/gnupg "$t/etc/pacman.d/gnupg" 2>/dev/null || return 1
+  # Генерируем САМОСТОЯТЕЛЬНЫЙ pacman.conf для офлайн-установки:
+  # прописываем Server напрямую, без Include (Include резолвится
+  # относительно хоста, а не таргета — pacman не видит серверов и
+  # падает с «no servers configured for repository: core»).
+  local _mirror
+  _mirror=$(head -1 /opt/sg-offline/mirrorlist 2>/dev/null | sed 's/^Server\s*=\s*//')
+  [[ -n "$_mirror" ]] || _mirror="https://geo.mirror.pkgbuild.com/$repo/os/$arch"
+  cat > "$t/etc/pacman.conf" <<PACCONF
+[options]
+Architecture = auto
+Color
+CheckSpace
+ParallelDownloads = 5
+SigLevel = Required DatabaseOptional
+LocalFileSigLevel = Optional
+[core]
+Server = $_mirror
+[extra]
+Server = $_mirror
+PACCONF
+  cp /opt/sg-offline/mirrorlist "$t/etc/pacman.d/mirrorlist" 2>/dev/null || true
+  # псевдо-ФС как в pacstrap (ошибки монтирования не фатальны)
+  mount -t proc proc "$t/proc" 2>/dev/null || true
+  mount -t sysfs sys "$t/sys" 2>/dev/null || true
+  mount -t devtmpfs dev "$t/dev" 2>/dev/null || true
+  mount -t devpts devpts "$t/dev/pts" -o gid=5,mode=0620 2>/dev/null || true
+  mount -t tmpfs shm "$t/dev/shm" 2>/dev/null || true
+  mount -t tmpfs run "$t/run" 2>/dev/null || true
+  # вывод pacman — в файл: при сбое показываем РЕАЛЬНУЮ ошибку в логе
+  # (раньше она глоталась, пользователь видел только «сбой установки пакетов»)
+  # ВАЖНО: --config указывает на pacman.conf ВНУТРИ таргета, иначе pacman
+  # читает хостовый /etc/pacman.conf (live-системы) и не видит серверов
+  # из зеркала, зашитого в ISO (/opt/sg-offline/mirrorlist).
+  if ! pacman --root "$t" --config "$t/etc/pacman.conf" \
+    --cachedir /opt/sg-offline/pkgs --noconfirm -S "$@" \
+    > /tmp/sg-offline-pacman.log 2>&1; then
+    tail -n 80 /tmp/sg-offline-pacman.log >> "$LOG" 2>/dev/null || true
+    return 1
+  fi
+  return 0
+}
+
+step 10 "Установка пакетов (10–25 минут; если интернета нет — из ISO)..."
+has_net=0
+timeout 8 curl -fsI https://geo.mirror.pkgbuild.com/ >/dev/null 2>&1 && has_net=1
+if [[ "${has_net}" -eq 1 ]]; then
+  if ! pacstrap -K "$TARGET" ${INSTALL_PKGS} > /tmp/sg-pacstrap.log 2>&1; then
+    # вывод pacstrap не глотаем — при сбое показываем хвост в логе установки
+    tail -n 80 /tmp/sg-pacstrap.log >> "$LOG" 2>/dev/null || true
+    step 10 "Интернет нестабилен — пробую офлайн-набор из ISO..."
+    sg_offline_install "$TARGET" ${INSTALL_PKGS} \
+      || die "сбой установки пакетов (pacstrap). Проверьте интернет и лог."
+  fi
+else
+  step 10 "Интернет не найден — ставлю из офлайн-набора, встроенного в ISO..."
+  sg_offline_install "$TARGET" ${INSTALL_PKGS} \
+    || die "сбой установки пакетов: нет интернета, а в ISO нет полного офлайн-набора (/opt/sg-offline). Подключите интернет или пересоберите ISO."
+fi
+
+step 85 "Генерация /etc/fstab..."
+genfstab -U "$TARGET" >> "$TARGET/etc/fstab" || die "не удалось сгенерировать fstab"
+# /proc: hidepid=2 — процесс видит только процессы своего UID (+ root/gid proc).
+# Session-комнаты больше не видят процессы хоста и других комнат;
+# обычному пользователю ps/top продолжают работать (свои процессы).
+printf 'proc /proc proc nosuid,nodev,noexec,hidepid=2,gid=proc 0 0\n' >> "$TARGET/etc/fstab"
+# host firewall: копируем ruleset (включается в chroot ниже)
+cp /etc/nftables.conf "$TARGET/etc/nftables.conf" 2>/dev/null || true
+
+ROOT_PARTUUID=$(blkid -s PARTUUID -o value "$ROOT" 2>/dev/null || true)
+
+# ---------------------------------------------------------------------------
+step 88 "Настройка системы (пользователь, загрузчик, SafeGuard)..."
+# shell-quote the values so passwords/special chars survive the heredoc
+Q_HOSTNAME=$(printf '%q' "$HOSTNAME")
+Q_USERNAME=$(printf '%q' "$USERNAME")
+Q_PASS=$(printf '%q' "$PASS")
+Q_SWAP_GB=$(printf '%q' "$SWAP_GB")
+SWAP_MIB=$(( SWAP_GB * 1024 ))   # plain number, interpolated below — no escaping traps
+Q_WINE=$(printf '%q' "$WINE")
+Q_DISK=$(printf '%q' "$DISK")
+Q_ROOT_PARTUUID=$(printf '%q' "$ROOT_PARTUUID")
+cat > "$TARGET/root/sg-chroot-setup.sh" <<CHROOT_EOF
+#!/usr/bin/env bash
+# runs inside the chroot
+set -uo pipefail
+HOSTNAME='$Q_HOSTNAME'
+USERNAME='$Q_USERNAME'
+PASS='$Q_PASS'
+SWAP_GB='$Q_SWAP_GB'
+WINE='$Q_WINE'
+DISK='$Q_DISK'
+ROOT_PARTUUID='$Q_ROOT_PARTUUID'
+
+# --- locale / hostname / branding ---
+sed -i 's/^#en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
+locale-gen >/dev/null 2>&1 || true
+echo 'LANG=en_US.UTF-8' > /etc/locale.conf
+echo 'KEYMAP=us' > /etc/vconsole.conf
+echo "\$HOSTNAME" > /etc/hostname
+ln -sf /usr/share/zoneinfo/UTC /etc/localtime
+cat > /usr/lib/os-release <<'EOF'
+NAME="safegamingOS"
+PRETTY_NAME="safegamingOS 0.11.3"
+ID=safegamingos
+ID_LIKE=arch
+BUILD_ID=rolling
+ANSI_COLOR="38;2;45;212;167"
+HOME_URL="https://github.com/met4444m-collab/safegameos"
+LOGO=safegamingos
+EOF
+
+# --- user (wheel + desktop groups, как в live) ---
+useradd -m -G wheel,audio,video,input,storage,power,users,network,optical,rfkill -s /bin/bash "\$USERNAME" 2>/dev/null || true
+echo "\$USERNAME:\$PASS" | chpasswd
+echo "root:\$PASS" | chpasswd
+# Автовход в установленную ОС (никакого экрана логина): SDDM на Arch делает
+# автовход только если пользователь в группе autologin, nopasswdlogin —
+# страховочный вход с пустым паролем, если автовход вдруг не сработал.
+groupadd -r autologin 2>/dev/null || true
+groupadd -r nopasswdlogin 2>/dev/null || true
+usermod -aG autologin,nopasswdlogin "\$USERNAME" 2>/dev/null || true
+
+# --- рабочий стол пользователя: иконки комнат + обои (executable = KDE
+#     доверяет и не спрашивает «Allow launching») ---
+mkdir -p "/home/\$USERNAME/Desktop" "/home/\$USERNAME/.config/autostart"
+for f in safegamingos-gui.desktop sg-browser.desktop sg-games.desktop sg-streaming.desktop; do
+  cp "/usr/share/applications/\$f" "/home/\$USERNAME/Desktop/" 2>/dev/null || true
+done
+chmod +x "/home/\$USERNAME/Desktop/"*.desktop 2>/dev/null || true
+cp /etc/skel/.config/autostart/sg-wallpaper.desktop "/home/\$USERNAME/.config/autostart/" 2>/dev/null || true
+chown -R "\$USERNAME:\$USERNAME" "/home/\$USERNAME/Desktop" "/home/\$USERNAME/.config" 2>/dev/null || true
+
+# --- сессия по умолчанию: автовход в рабочий стол + Wayland (X11 остаётся
+#     в списке сессий как fallback). SDDM на Arch: автовход требует группу
+#     autologin у пользователя (добавлена выше) — иначе будет экран логина. ---
+mkdir -p /etc/sddm.conf.d
+cat > /etc/sddm.conf.d/10-safegamingos.conf <<EOF
+# safegamingOS: автовход без пароля + Wayland-сессия по умолчанию — на X11
+# любой процесс сессии видит весь экран и клавиатуру, на Wayland экран/ввод
+# изолированы порталами.
+[Autologin]
+User=\$USERNAME
+Session=plasmawayland
+Relogin=true
+
+[General]
+Session=plasmawayland
+HaltCommand=/usr/bin/systemctl poweroff
+RebootCommand=/usr/bin/systemctl reboot
+EOF
+
+# --- firewall: врубаем nftables (вход по умолчанию закрыт) ---
+systemctl enable nftables >/dev/null 2>&1 || true
+
+# --- загрузчик: GRUB (UEFI fallback + BIOS) ---
+if [ -d /sys/firmware/efi ]; then
+  grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB --removable >/dev/null 2>&1 \
+    || grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB >/dev/null 2>&1 || true
+else
+  grub-install --target=i386-pc --recheck "\$DISK" >/dev/null 2>&1 || true
+fi
+sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="quiet splash apparmor=1 security=apparmor"/' /etc/default/grub
+grub-mkconfig -o /boot/grub/grub.cfg >/dev/null 2>&1 || true
+
+# --- initramfs: plymouth-хук + тема ---
+if command -v plymouth-set-default-theme >/dev/null 2>&1; then
+  plymouth-set-default-theme safegamingos 2>/dev/null || true
+fi
+if ! grep -q plymouth /etc/mkinitcpio.conf 2>/dev/null; then
+  sed -i 's/\\(HOOKS=([^)]*kms\\)/\\1 plymouth/' /etc/mkinitcpio.conf 2>/dev/null \
+    || sed -i 's/\\(HOOKS=([^)]*udev\\)/\\1 plymouth/' /etc/mkinitcpio.conf 2>/dev/null || true
+fi
+mkinitcpio -P >/dev/null 2>&1 || true
+
+# --- swapfile ${SWAP_GB}G (${SWAP_MIB} MiB) ---
+if ! grep -qE "swapfile" /etc/fstab 2>/dev/null; then
+  if fallocate -l "${SWAP_MIB}M" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=${SWAP_MIB} 2>/dev/null; then
+    chmod 600 /swapfile
+    mkswap /swapfile >/dev/null 2>&1
+    echo "/swapfile none swap defaults 0 0" >> /etc/fstab
+  fi
+fi
+
+# --- SafeGuard: база комнат, службы ---
+if [ -f /usr/local/lib/sg-rooms/lib.sh ]; then
+  # shellcheck source=/dev/null
+  source /usr/local/lib/sg-rooms/lib.sh
+  sg_ensure_db 2>/dev/null || true
+  sg_default_rooms 2>/dev/null || true
+fi
+systemctl enable sddm NetworkManager sg-watch sg-track apparmor nftables >/dev/null 2>&1 || true
+systemctl enable clamav-freshclam clamav-freshclam.timer >/dev/null 2>&1 || true
+systemctl enable sg-av-scan.timer >/dev/null 2>&1 || true
+systemctl enable freeze-bg.service >/dev/null 2>&1 || true
+if [ -f /etc/sysctl.d/99-safegamingos.conf ]; then
+  sysctl --system >/dev/null 2>&1 || true
+fi
+
+# --- freeze-bg: заморозка фоновых процессов ---
+mkdir -p /etc/freeze-bg
+chmod 700 /etc/freeze-bg
+
+# --- ребрендинг: скрыть KDE Welcome Center ---
+mkdir -p /etc/xdg/autostart
+printf '[Desktop Entry]\nType=Application\nName=Plasma Welcome\nHidden=true\nNoDisplay=true\n' > /etc/xdg/autostart/org.kde.plasma-welcome.desktop
+
+# --- Windows-игры (по выбору) ---
+if [ "\$WINE" = "1" ]; then
+  sed -i '/^#[multilib]/{s/^#//;n;s/^#//;}' /etc/pacman.conf
+  pacman -Sy --noconfirm >/dev/null 2>&1 || true
+  pacman -S --noconfirm --needed wine wine-mono wine-gecko steam lutris gamemode \
+    lib32-gamemode lib32-mesa lib32-vulkan-intel lib32-vulkan-radeon lib32-libpulse \
+    >/dev/null 2>&1 || true
+fi
+
+rm -f /root/sg-chroot-setup.sh
+exit 0
+CHROOT_EOF
+
+if ! arch-chroot "$TARGET" /bin/bash /root/sg-chroot-setup.sh > /tmp/sg-chroot.log 2>&1; then
+  tail -n 80 /tmp/sg-chroot.log >> "$LOG" 2>/dev/null || true
+  die "сбой настройки системы (см. лог)"
+fi
+[ -e "$TARGET/root/sg-chroot-setup.sh" ] && rm -f "$TARGET/root/sg-chroot-setup.sh"
+
+step 100 "Установка завершена"
+echo "DONE|Установка safegamingOS завершена! Отключите ISO и перезагрузите виртуалку."
+exit 0

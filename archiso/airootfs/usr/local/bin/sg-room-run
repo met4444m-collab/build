@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+# safegamingOS — запустить приложение в изолированной комнате (firejail).
+#
+# Usage:
+#   sudo sg-room-run NAME -- APP [АРГУМЕНТЫ...]
+#   sudo sg-room-run --game NAME -- APP [АРГУМЕНТЫ...]     игровая комната
+#   sudo sg-room-run --net NAME -- APP [АРГУМЕНТЫ...]      принудительно с сетью
+#   sudo sg-room-run --offline NAME -- APP [АРГУМЕНТЫ...]  без сети (по умолчанию так,
+#                                                          если сеть не включена для комнаты: sg-net ROOM on)
+#   sudo sg-room-run --x11-isolate NAME -- APP [АРГУМЕНТЫ...]  отдельный дисплей (Xephyr)
+#   --x11-isolate: приложение работает в собственном виртуальном дисплее и
+#   физически не видит экран/клавиатуру хоста (для X11-сессий; в Wayland не нужно)
+#   sudo sg-room-run --type TYPE --mem 4G --cpu 200 NAME -- APP
+#
+# Типы: browser, games, general, streaming, offline.
+# Игровая комната получает разрешение на доступ к экрану/звуку/вводу сессии
+# (нужно для OBS, игр, стримов) — остальные комнаты таких прав не имеют.
+set -uo pipefail
+
+source /usr/local/lib/sg-rooms/lib.sh
+sg_require sqlite3 firejail
+[[ $EUID -eq 0 ]] || { echo "error: запустите от root: sudo sg-room-run ..." >&2; exit 1; }
+
+usage() { grep '^#' "$0" | sed 's/^# \{0,1\}//' | grep -v 'env bash'; }
+
+type="general"
+mem="4G"
+cpu="200"
+mem_set=0
+cpu_set=0
+game=0
+offline=0
+net_flag=0
+x11iso=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --type)   type="${2:?--type требует значение}"; shift 2 ;;
+    --mem)    mem="${2:?--mem требует значение}"; mem_set=1; shift 2 ;;
+    --cpu)    cpu="${2:?--cpu требует значение}"; cpu_set=1; shift 2 ;;
+    --game)   game=1; shift ;;
+    --net)     net_flag=1; shift ;;
+    --offline) offline=1; shift ;;
+    --x11-isolate) x11iso=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --)       shift; break ;;
+    *)        break ;;
+  esac
+done
+
+[[ $# -ge 2 ]] || { usage >&2; exit 1; }
+name="$1"; shift
+[[ "${1:-}" == "--" ]] && shift
+app="${1:-}"
+[[ -n "${app}" ]] || { usage >&2; exit 1; }
+shift || true
+
+slug="$(slugify "${name}")"
+[[ -n "${slug}" ]] || { echo "error: пустое имя комнаты" >&2; exit 1; }
+
+sg_ensure_db
+session_user="$(real_user)"
+[[ -n "${session_user}" && "${session_user}" != "root" ]] || { echo "error: не удалось определить пользователя" >&2; exit 1; }
+
+# --- лимиты ресурсов (по умолчанию игровые комнаты получают больше) ---
+if [[ ${game} -eq 1 ]]; then
+  [[ ${mem_set} -eq 0 ]] && mem="8G"
+  [[ ${cpu_set} -eq 0 ]] && cpu="400"
+fi
+[[ "${mem}" == "0" || -n "$(numfmt --from=iec "${mem}" 2>/dev/null)" ]] \
+  || { echo "error: неверный --mem: ${mem} (пример: 4G, 512M, 0 = без лимита)" >&2; exit 1; }
+[[ "${cpu}" =~ ^[0-9]+$ ]] \
+  || { echo "error: неверный --cpu: ${cpu} (пример: 200 = 2 ядра, 0 = без лимита)" >&2; exit 1; }
+
+# --- комната в базе ---
+if ! sg_room_exists "${slug}"; then
+  [[ ${game} -eq 1 ]] && type="games"
+  sqlite3 "${SG_DB}" \
+    "INSERT INTO rooms(id,name,type,status,mem,cpu,app,created)
+     VALUES('$(sg_esc "${slug}")','$(sg_esc "${name}")','$(sg_esc "${type}")','running','$(sg_esc "${mem}")','$(sg_esc "${cpu}")','$(sg_esc "${app}")',$(sg_now));"
+else
+  sqlite3 "${SG_DB}" "UPDATE rooms SET app='$(sg_esc "${app}")', mem='$(sg_esc "${mem}")', cpu='$(sg_esc "${cpu}")' WHERE id='$(sg_esc "${slug}")';"
+  # тип комнаты берём из базы — политика сети и UID привязаны к нему
+  db_type="$(sqlite3 "${SG_DB}" "SELECT type FROM rooms WHERE id='$(sg_esc "${slug}")';" 2>/dev/null)"
+  [[ -n "${db_type}" ]] && type="${db_type}"
+fi
+
+# --- per-room UID: обычные комнаты получают собственного системного
+#     пользователя (sgroom-<slug>) — чужие /proc, /dev/shm, сокеты сессии
+#     и файлы других UID для них закрыты ядром. Комнаты с доступом к
+#     сессии (browser/games/streaming) работают от пользователя сессии:
+#     им нужны PipeWire-сокет и экран (осознанный трейдофф продукта).
+#     Тип берём из базы (или из CLI для новой комнаты) — иначе комната
+#     browser, запущенная без --type, потеряла бы звук. ---
+user="$(sg_room_user "${slug}" "${type}")"
+sg_ensure_room_user "${user}" "$(sg_room_home "${slug}")" || exit 1
+
+# --- домашний каталог комнаты (изолирован через --private) ---
+home="$(sg_room_home "${slug}")"
+mkdir -p "${home}/Downloads" "${home}/Documents" "${home}/.config"
+chown -R "${user}:${user}" "${home}" 2>/dev/null || true
+chmod 700 "${home}" 2>/dev/null || true
+
+# --- авто-снапшот «из коробки»: 1 в день, храним 5 (откат за секунды) ---
+sg_snapshot_auto "${slug}" >/dev/null 2>&1 || true
+
+# --- firejail: изоляция ---
+# --seccomp=ptrace,process_vm_readv,process_vm_writev РАСШИРЯЕТ стандартный
+# фильтр: запрещает чтение/запись чужой памяти даже для процессов одного UID
+# (страховка к yama ptrace_scope — session-комнаты одного пользователя не
+# смогут шпионить друг за другом). --nonewprivs: setuid-бинарники внутри
+# комнаты не дают привилегий (PR_SET_NO_NEW_PRIVS) — нет лестницы наружу
+# даже через легитимный /usr/bin/passwd и т.п.
+fj=(firejail --name="${slug}" --hostname="${slug}" --private="${home}"
+    --private-tmp --noroot --caps.drop=all --nonewprivs
+    --seccomp=ptrace,process_vm_readv,process_vm_writev
+    --protocol=unix,inet,inet6 --shell=/bin/bash)
+
+# --- жёсткие опции (страховка от старых версий firejail) ---
+fj_supports ipc-namespace && fj+=(--ipc-namespace)
+# --machine-id ломает звук (см. man firejail) — даём его только комнатам
+# с per-room UID (им звук не нужен). Session-комнатам (browser/games/
+# streaming) звук нужен — machine-id им не добавляем.
+if fj_supports machine-id && [[ "${user}" != "${session_user}" ]]; then
+  fj+=(--machine-id)
+fi
+
+# --- AppArmor (MAC поверх firejail): процессы комнаты попадают под профиль
+#     firejail-default и остаются ограниченными, даже если firejail обойдён.
+#     Профиль наследуется всеми дочерними процессами комнаты.
+#     Флаг добавляем только если AppArmor реально загружен и профиль есть,
+#     иначе firejail отказался бы стартовать. ---
+if fj_supports apparmor \
+   && [[ -f /sys/module/apparmor/parameters/enabled ]] \
+   && grep -qi y /sys/module/apparmor/parameters/enabled \
+   && grep -q "firejail-default" /sys/kernel/security/apparmor/profiles 2>/dev/null; then
+  fj+=(--apparmor)
+fi
+
+# --- setuid-инструменты администрирования внутри комнаты = лестница наружу.
+#     Комнате они не нужны: админ-команды запускаются снаружи (pkexec/sudo). ---
+fj+=(--blacklist=/usr/bin/sudo --blacklist=/usr/bin/pkexec
+     --blacklist=/usr/bin/su --blacklist=/usr/bin/runuser)
+
+# --- отладчики/трассировщики: ptrace-шпионаж за чужими процессами
+#     (страховка к yama ptrace_scope=1; отладка ведётся снаружи комнаты). ---
+fj+=(--blacklist=/usr/bin/strace --blacklist=/usr/bin/ltrace
+     --blacklist=/usr/bin/gdb --blacklist=/usr/bin/gdbserver)
+
+# --- сетевые эксфил/развед-инструменты: сейчас их нет в системе, но если
+#     пользователь доустановит (netcat/nmap/...), внутри комнат они должны
+#     остаться недоступны — никаких обратных шеллов и сканеров (защита
+#     вглубь поверх сетевой политики комнат). ---
+fj+=(--blacklist=/usr/bin/nc --blacklist=/usr/bin/ncat
+     --blacklist=/usr/bin/socat --blacklist=/usr/bin/telnet
+     --blacklist=/usr/bin/nmap)
+
+# --- сам firejail внутри комнаты: нельзя запустить вложенный jail или
+#     --join в другую комнату (двойной jail = обход имени песочницы). ---
+fj+=(--blacklist=/usr/bin/firejail)
+
+# --- общий /var/tmp = межкомнатный почтовый ящик для файлов ---
+fj+=(--blacklist=/var/tmp)
+
+# --- весь SG_ROOT (другие комнаты, карантин, снапшоты, база) и журнал:
+#     root-only; чёрный список — страховка к chmod 700/0600 ---
+fj+=(--blacklist="${SG_ROOT}" --blacklist="${SG_LOG}")
+
+# --- межкомнатная файловая изоляция: ни одна комната не видит чужие home/карантин ---
+while IFS= read -r other; do
+  [[ -n "${other}" ]] && fj+=(--blacklist="$(sg_room_home "${other}")")
+done < <(sqlite3 "${SG_DB}" "SELECT id FROM rooms WHERE id != '$(sg_esc "${slug}")';" 2>/dev/null)
+fj+=(--blacklist="${SG_QUARANTINE}")
+
+# --- D-Bus: не-игровые комнаты отрезаны и от сессионной, и от системной шины.
+#     Игровые (OBS/стрим) оставляем с доступом — им нужен. ---
+if [[ ${game} -eq 0 ]]; then
+  fj+=(--dbus-user=none)
+  fj_supports dbus-system && fj+=(--dbus-system=none)
+fi
+
+# --- X11-изоляция по запросу (только не-игровые): отдельный дисплей Xephyr.
+#     Приложение работает в собственном виртуальном экране и физически не может
+#     снимать экран хоста или перехватывать клавиатуру (нужно для X11-сессий;
+#     в Wayland-сессии изоляция обеспечивается самим дисплейным сервером). ---
+if [[ ${x11iso} -eq 1 ]]; then
+  if [[ ${game} -eq 1 ]]; then
+    echo "warning: --x11-isolate игнорируется для игровых комнат (нужен реальный дисплей)" >&2
+  elif ! command -v Xephyr >/dev/null 2>&1; then
+    echo "error: --x11-isolate требует пакет xorg-server-xephyr" >&2
+    exit 1
+  else
+    fj+=(--x11)
+  fi
+fi
+
+# --- сеть: по умолчанию только комнаты, которым она нужна из коробки
+#     (browser/games/streaming). Остальные стартуют с --net=none — вирус не
+#     сможет отправить данные наружу. Политика комнаты: sg-net ROOM on|off;
+#     разовые переопределения: --net / --offline. ---
+net_perm="$(sg_net_get "${slug}" "${type}")"
+if [[ ${offline} -eq 1 ]]; then
+  fj+=(--net=none)
+elif [[ ${net_flag} -eq 1 ]]; then
+  :
+elif [[ "${net_perm}" == "0" ]]; then
+  fj+=(--net=none)
+fi
+
+if [[ ${game} -eq 1 ]]; then
+  sg_permission_set "${slug}" game 1
+  sg_event "game" "Игровой режим включён для комнаты «${slug}»."
+  echo "==> игровая комната «${slug}»: доступ к экрану/звуку/вводу разрешён"
+fi
+
+echo "==> запуск «${app}» в комнате «${slug}» (${home})"
+if [[ "${user}" != "${session_user}" ]]; then
+  echo "    UID:        ${user} (per-room UID — изоляция ядром)"
+else
+  echo "    UID:        ${user} (сессия — комната типа ${type})"
+fi
+if [[ "${fj[*]}" == *"--apparmor"* ]]; then
+  echo "    AppArmor:   профиль firejail-default (MAC)"
+fi
+[[ "${mem}" != "0" ]] && echo "    лимит RAM:  ${mem}  (cgroup, без swap)"
+[[ "${cpu}" != "0" ]] && echo "    лимит CPU:  ${cpu}%  (cgroup)"
+if [[ ${offline} -eq 1 || ( ${net_flag} -eq 0 && "${net_perm}" == "0" ) ]]; then
+  echo "    сеть:       ВЫКЛЮЧЕНА (данные наружу не уйдут)"
+else
+  echo "    сеть:       включена (выключить: sudo sg-net ${slug} off)"
+fi
+echo "    закрыть комнату: firejail --shutdown=${slug}    (или sudo sg-quarantine ${slug})"
+echo
+
+# --- принудительные лимиты CPU/RAM через systemd-скоуп (cgroup v2) ---
+if command -v systemd-run >/dev/null 2>&1; then
+  unit="sg-${slug}"
+  systemctl list-units --type=scope --no-legend 2>/dev/null | grep -q " ${unit}\.scope" \
+    && unit="sg-${slug}-$RANDOM"
+  sd=(systemd-run --scope --unit="${unit}" --collect
+      -p OOMPolicy=kill -p TasksMax=256)
+  if [[ "${mem}" != "0" ]]; then
+    sd+=(-p "MemoryMax=$(numfmt --from=iec "${mem}")" -p MemorySwapMax=0)
+  fi
+  if [[ "${cpu}" != "0" ]]; then
+    sd+=(-p "CPUQuota=${cpu}%")
+  fi
+  exec "${sd[@]}" sudo -u "${user}" -- "${fj[@]}" "${app}" "$@"
+fi
+
+# --- fallback без systemd: rlimit внутри firejail ---
+[[ "${mem}" != "0" ]] && fj+=(--rlimit-as="$(numfmt --from=iec "${mem}")")
+exec sudo -u "${user}" -- "${fj[@]}" "${app}" "$@"
