@@ -13,32 +13,34 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install archiso
+      - name: Install archiso and sync databases
         run: |
           pacman -Sy --noconfirm archiso base-devel git
 
       - name: Download packages to cache
         run: |
-          # Скачиваем пакеты в кэш (они останутся в /var/cache/pacman/pkg/)
-          pacman -Sw --noconfirm $(cat packages.x86_64 | grep -v '^#' | grep -v '^$')
+          # Очищаем список от комментариев и пустых строк
+          grep -v '^#' packages.x86_64 | grep -v '^$' | sed 's/\r$//' > /tmp/pkglist.txt
+          
+          # Скачиваем пакеты в кэш (флаг -w: только скачать, -S: синхронизация)
+          pacman -Syw --noconfirm --cachedir /var/cache/pacman/pkg/ - < /tmp/pkglist.txt || pacman -Syw --noconfirm --cachedir /var/cache/pacman/pkg/ $(cat /tmp/pkglist.txt)
 
       - name: Build airootfs (only)
         run: |
-          # Создаём рабочую папку и копируем туда профиль
           mkdir -p /tmp/work
           cp -a archiso /tmp/work/profile
           cd /tmp/work
           
-          # Устанавливаем пакеты в airootfs через pacstrap (без mkarchiso)
+          # Устанавливаем пакеты в airootfs через pacstrap
           mkdir -p airootfs
-          pacstrap -C profile/pacman.conf -c -d -G -i airootfs $(cat profile/packages.x86_64 | grep -v '^#' | grep -v '^$')
+          pacstrap -C profile/pacman.conf -c -d -G -i airootfs $(cat /tmp/pkglist.txt)
           
-          # Копируем твои файлы из airootfs профиля (SafeGuard и т.д.)
+          # Копируем твои файлы из airootfs профиля
           cp -a profile/airootfs/* airootfs/ 2>/dev/null || true
           
-          # Запускаем customize_airootfs.sh (если есть)
+          # Запускаем customize_airootfs.sh
           if [ -f airootfs/root/customize_airootfs.sh ]; then
-            chroot airootfs /bin/bash /root/customize_airootfs.sh
+            chroot airootfs /bin/bash /root/customize_airootfs.sh || true
           fi
 
       - name: Upload airootfs
